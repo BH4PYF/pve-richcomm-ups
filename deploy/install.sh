@@ -37,6 +37,13 @@ install -m 644 "$SRC/99-ups-nosuspend.rules" /etc/udev/rules.d/99-ups-nosuspend.
 install -m 755 "$SRC/ups-linkcheck"          /usr/local/sbin/ups-linkcheck
 install -m 644 "$SRC/ups-linkcheck.service"  /etc/systemd/system/ups-linkcheck.service
 install -m 644 "$SRC/ups-linkcheck.timer"    /etc/systemd/system/ups-linkcheck.timer
+
+# Diagnostics that stay on: USB state vs NIC link correlation, and a usbmon
+# trace kept as wire evidence for future link drops.  Both are read-only.
+install -m 755 "$SRC/ups-net-watch"          /usr/local/sbin/ups-net-watch
+install -m 644 "$SRC/ups-net-watch.service"  /etc/systemd/system/ups-net-watch.service
+install -m 755 "$SRC/usbmon-ups.py"          /usr/local/lib/ups-pve/usbmon-ups.py
+install -m 644 "$SRC/ups-usbmon.service"     /etc/systemd/system/ups-usbmon.service
 install -m 755 "$SRC/ups-selftest.py"        /usr/local/sbin/ups-selftest
 install -m 755 "$SRC/ups-selftest-watch.py"  /usr/local/sbin/ups-selftest-watch
 install -m 755 "$SRC/ups-selftest-guard.py"  /usr/local/sbin/ups-selftest-guard
@@ -81,6 +88,7 @@ systemctl enable ups-nut-bridge.service
 systemctl restart ups-poller.service
 systemctl restart ups-nut-bridge.service
 systemctl enable --now ups-linkcheck.timer
+systemctl enable --now ups-net-watch.service ups-usbmon.service
 udevadm control --reload-rules 2>/dev/null || true
 
 # The runtime test logger is started by hand for a discharge test only.
