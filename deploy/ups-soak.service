@@ -1,0 +1,14 @@
+[Unit]
+Description=UPS poller soak logger (one line per minute, never touches the device)
+After=ups-poller.service
+Wants=ups-poller.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ups-soak
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

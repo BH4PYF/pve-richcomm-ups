@@ -1,0 +1,14 @@
+[Unit]
+Description=Richcomm UPS monitor -> NUT dummy-ups bridge
+After=network.target ups-poller.service
+Wants=ups-poller.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/ups-pve/nut_bridge.py
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

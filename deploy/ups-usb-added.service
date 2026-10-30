@@ -1,0 +1,11 @@
+[Unit]
+Description=Restart the UPS poller after the USB bridge re-enumerates
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+# A re-plug gives the device a new devnum and can leave libusb holding a stale
+# handle to the old one.  The poller does re-open on USB errors by itself, but a
+# clean restart on every add guarantees the first open lands on the new device.
+ExecStart=/bin/sh -c 'sleep 2; systemctl restart ups-poller'
+TimeoutStartSec=90

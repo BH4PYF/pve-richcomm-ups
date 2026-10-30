@@ -1,0 +1,14 @@
+[Unit]
+Description=UPS state vs NIC link correlation logger
+After=network.target ups-poller.service
+Wants=ups-poller.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ups-net-watch
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

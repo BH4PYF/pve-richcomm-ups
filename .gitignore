@@ -1,0 +1,27 @@
+# Real credentials — never commit
+**/dingtalk.env
+deploy/upsd.users.local
+*.secret
+*.token
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Runtime data and backups
+*.bak
+*.bak.*
+*.tmp
+
+# Vendor binaries, installers and manuals (not redistributed)
+payload/
+setup.exe
+*.tar.gz
+*.pdf
+
+# Windows WOL log
+windows/wol.log
+
+# Editors
+.vscode/
+.idea/

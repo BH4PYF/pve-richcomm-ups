@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the UPS USB link check every two minutes
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=120s
+AccuracySec=10s
+Unit=ups-linkcheck.service
+
+[Install]
+WantedBy=timers.target

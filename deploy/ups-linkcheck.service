@@ -1,0 +1,8 @@
+[Unit]
+Description=UPS USB link health check and incident capture
+After=ups-poller.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ups-linkcheck
+Nice=10

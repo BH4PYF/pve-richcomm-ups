@@ -1,0 +1,14 @@
+[Unit]
+Description=usbmon trace of the UPS USB traffic (wire evidence for drops)
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStartPre=-/bin/sh -c 'mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug'
+ExecStart=/usr/bin/python3 /usr/local/lib/ups-pve/usbmon-ups.py
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

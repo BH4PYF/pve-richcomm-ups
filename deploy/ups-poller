@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""Talk to the Richcomm UPS directly over usbfs (libusb) and publish its state.
+
+This replaces the vendor's 32-bit ups_monitor daemon.  The vendor daemon owns
+the device through the kernel usbhid/hiddev path, which polls the interrupt
+endpoint at ~250 Hz (bInterval=1, usbhid double-buffers); a Windows VM using
+the same UPS through QEMU's usbfs path saw 125 Hz and never dropped the link.
+This poller takes the same route as QEMU: detach usbhid, claim interface 0,
+and drain one interrupt transfer at a time.
+
+Protocol (usbmon captures, 2026-10-29/30)
+-----------------------------------------
+Commands are SET_REPORT bmRequestType 0x21 / bRequest 0x09 / wValue 0x0200 /
+wIndex 0, payload 0xA0|len + ASCII (+ CR for some).  The device answers by
+streaming its status text on interrupt IN 0x81 as 6-byte reports: byte 1 is
+one character, bytes 2..3 are a constant "10" tag, bytes 4..5 are zero.
+
+    #220.0 003 12.00 50.0                          rating line
+    (227.0 000.0 228.0 018 50.0 12.2 30.8 00001001  Q1 status line
+
+Q1 fields: input V, fault V, output V, load %, line Hz, one 12 V block of the
+24 V pack, temperature C, 8 status bits (MSB first; same word the vendor shm
+carried: 0x09 normal on mains, 0x80 mains fail, 0x04 self-test in progress).
+
+Output
+------
+/run/ups-poller/state.json   structured state, ts = last valid status line
+/run/ups-poller/screen.txt   vendor-screen-like labels for nut_bridge.py
+/run/ups-poller/acfail.since  when the current mains failure began (survives
+                              a service restart, so the 1 h clock does not
+                              reset when the link is repaired mid-outage)
+Shutdown: when the input has been bad for TimeCfg.conf's AC-fail delay, run
+the vendor's shutdown.sh exactly as ups_monitor did.  -1 disables it.
+UPS_SHUTDOWN_SCRIPT overrides the script for a dry run with a stub.
+"""
+
+import ctypes as C
+import json
+import os
+import struct
+import subprocess
+import sys
+import time
+
+VID, PID = 0x0925, 0x1234
+EP_IN = 0x81
+REPORT_PREFIX = 0xA0
+TERMINATOR = 0x0D
+VENDOR_DIR = "/opt/ups-manager"
+TIMECFG = os.path.join(VENDOR_DIR, "TimeCfg.conf")
+SHUTDOWN = os.environ.get("UPS_SHUTDOWN_SCRIPT",
+                          os.path.join(VENDOR_DIR, "shutdown.sh"))
+RUNTIME_CONF = "/etc/ups-pve/runtime.conf"
+STATE_DIR = "/run/ups-poller"
+STATE_PATH = os.path.join(STATE_DIR, "state.json")
+SCREEN_PATH = os.path.join(STATE_DIR, "screen.txt")
+ACFAIL_PATH = os.path.join(STATE_DIR, "acfail.since")
+LIBUSB_ERROR_NO_DEVICE = -4
+LIBUSB_ERROR_TIMEOUT = -7
+Q1_SECONDS = 1.2
+PUBLISH_SECONDS = 1.0
+STALE_SECONDS = 5.0
+
+# Same opening sequence IpPowerSE and the vendor daemon use.  The UPS ignores
+# commands until it has seen this prologue.
+PRELUDE = [(0x21, 0x0A, 0x0000, 0, b""),
+           (0x21, 0x09, 0x0200, 0, bytes.fromhex("80d00000")),
+           (0x21, 0x09, 0x0200, 0, bytes.fromhex("a2490d00")),
+           (0x21, 0x09, 0x0200, 0, bytes.fromhex("a2460d00")),
+           (0x21, 0x09, 0x0200, 0, bytes.fromhex("a351310d"))]
+
+
+def q1_frame():
+    return bytes([REPORT_PREFIX | 3]) + b"Q1" + bytes([TERMINATOR])
+
+
+class DevDesc(C.Structure):
+    _fields_ = [
+        ("bLength", C.c_uint8), ("bDescriptorType", C.c_uint8),
+        ("bcdUSB", C.c_uint16), ("bDeviceClass", C.c_uint8),
+        ("bDeviceSubClass", C.c_uint8), ("bDeviceProtocol", C.c_uint8),
+        ("bMaxPacketSize0", C.c_uint8), ("idVendor", C.c_uint16),
+        ("idProduct", C.c_uint16), ("bcdDevice", C.c_uint16),
+        ("iManufacturer", C.c_uint8), ("iProduct", C.c_uint8),
+        ("iSerialNumber", C.c_uint8), ("bNumConfigurations", C.c_uint8),
+    ]
+
+
+def load_timecfg():
+    """AC-fail delay, battery-low delay and UPS-bad delay from TimeCfg.conf.
+
+    Layout: 4-byte magic 35 03 aa 55, then int32 LE values at offsets 4, 8, 12.
+    -1 cancels the timer.
+    """
+    try:
+        with open(TIMECFG, "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return None, None, None
+    if len(raw) < 16 or raw[:4] != bytes.fromhex("3503aa55"):
+        return None, None, None
+    acfail, low, bad = struct.unpack_from("<iii", raw, 4)
+    return (None if acfail < 0 else acfail,
+            None if low < 0 else low,
+            None if bad < 0 else bad)
+
+
+def read_acfail():
+    """Start of the current mains failure, from a previous poller run."""
+    try:
+        with open(ACFAIL_PATH) as handle:
+            return float(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def save_acfail(stamp):
+    try:
+        with open(ACFAIL_PATH, "w") as handle:
+            handle.write("%.3f\n" % stamp)
+    except OSError:
+        pass
+
+
+def clear_acfail():
+    try:
+        os.unlink(ACFAIL_PATH)
+    except OSError:
+        pass
+
+
+def load_lb_voltage():
+    """LB_VOLTAGE (raw pack volts) from runtime.conf, or None when absent.
+
+    Same threshold the bridge uses for NUT's LB, so the host and the NUT
+    clients agree on when the battery counts as low.
+    """
+    try:
+        with open(RUNTIME_CONF, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line.startswith("LB_VOLTAGE="):
+                    return float(line.split("=", 1)[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+class Ups(object):
+    def __init__(self):
+        self.lib = C.CDLL("libusb-1.0.so.0")
+        self.lib.libusb_init.argtypes = [C.POINTER(C.c_void_p)]
+        self.lib.libusb_init.restype = C.c_int
+        self.lib.libusb_get_device_list.argtypes = [C.c_void_p,
+                                                    C.POINTER(C.POINTER(C.c_void_p))]
+        self.lib.libusb_get_device_list.restype = C.c_ssize_t
+        self.lib.libusb_get_device_descriptor.argtypes = [C.c_void_p,
+                                                          C.POINTER(DevDesc)]
+        self.lib.libusb_open.argtypes = [C.c_void_p, C.POINTER(C.c_void_p)]
+        self.lib.libusb_detach_kernel_driver.argtypes = [C.c_void_p, C.c_int]
+        self.lib.libusb_attach_kernel_driver.argtypes = [C.c_void_p, C.c_int]
+        self.lib.libusb_claim_interface.argtypes = [C.c_void_p, C.c_int]
+        self.lib.libusb_control_transfer.argtypes = [
+            C.c_void_p, C.c_uint8, C.c_uint8, C.c_uint16, C.c_uint16,
+            C.POINTER(C.c_ubyte), C.c_uint16, C.c_uint]
+        self.lib.libusb_control_transfer.restype = C.c_int
+        self.lib.libusb_interrupt_transfer.argtypes = [
+            C.c_void_p, C.c_ubyte, C.POINTER(C.c_ubyte), C.c_int,
+            C.POINTER(C.c_int), C.c_uint]
+        self.lib.libusb_interrupt_transfer.restype = C.c_int
+        self.lib.libusb_release_interface.argtypes = [C.c_void_p, C.c_int]
+        self.lib.libusb_close.argtypes = [C.c_void_p]
+        self.lib.libusb_free_device_list.argtypes = [C.POINTER(C.c_void_p),
+                                                     C.c_int]
+        self.lib.libusb_exit.argtypes = [C.c_void_p]
+        self.ctx = C.c_void_p()
+        if self.lib.libusb_init(C.byref(self.ctx)) != 0:
+            raise RuntimeError("libusb_init failed")
+        self.handle = C.c_void_p()
+        self.detached = False
+        self.buf = (C.c_ubyte * 8)()
+        self.got = C.c_int(0)
+
+    def open(self):
+        devs = C.POINTER(C.c_void_p)()
+        count = self.lib.libusb_get_device_list(self.ctx, C.byref(devs))
+        found = None
+        for i in range(count):
+            desc = DevDesc()
+            self.lib.libusb_get_device_descriptor(devs[i], C.byref(desc))
+            if desc.idVendor == VID and desc.idProduct == PID:
+                found = devs[i]
+                break
+        if not found:
+            self.lib.libusb_free_device_list(devs, 1)
+            return False
+        rc = self.lib.libusb_open(found, C.byref(self.handle))
+        self.lib.libusb_free_device_list(devs, 1)
+        if rc != 0:
+            return False
+        self.detached = self.lib.libusb_detach_kernel_driver(self.handle, 0) == 0
+        rc = self.lib.libusb_claim_interface(self.handle, 0)
+        if rc != 0:
+            self.close()
+            return False
+        for request_type, request, value, index, data in PRELUDE:
+            self.send(request_type, request, value, index, data)
+            time.sleep(0.2)
+        return True
+
+    def close(self):
+        if self.handle:
+            self.lib.libusb_release_interface(self.handle, 0)
+            if self.detached:
+                self.lib.libusb_attach_kernel_driver(self.handle, 0)
+                self.detached = False
+            self.lib.libusb_close(self.handle)
+            self.handle = C.c_void_p()
+
+    def send(self, request_type, request, value, index, data, timeout=1000):
+        size = len(data)
+        buf = (C.c_ubyte * max(size, 1))(*data) if size else None
+        return self.lib.libusb_control_transfer(
+            self.handle, request_type, request, value, index, buf, size,
+            timeout)
+
+    def read(self, timeout_ms=200):
+        rc = self.lib.libusb_interrupt_transfer(
+            self.handle, EP_IN, self.buf, 6, C.byref(self.got), timeout_ms)
+        if rc == 0 and self.got.value >= 2:
+            return rc, bytes(self.buf[:self.got.value])
+        return rc, None
+
+
+def gauge(block):
+    """Vendor charge percentage: 0.1 V/block lookup, 0-100 over 20.0-27.2 V.
+
+    charge% = round((Vblock - 10.0) * 10) / 36 * 100
+    """
+    if block is None:
+        return None
+    steps = round((block - 10.0) * 10.0)
+    return max(0.0, min(100.0, steps / 36.0 * 100.0))
+
+
+def screen_text(state):
+    """Labels match what nut_bridge.py's regexes were written against."""
+    def num(value, default=0.0):
+        return default if value is None else value
+    ac = "Bad" if state.get("ac_fail") else "Normal"
+    test = "Testing" if state.get("testing") else "Normal"
+    bb = "Buck" if num(state.get("input_voltage")) > 50 else "None"
+    return (
+        "UPS Input Voltage: %.2f Volt\n"
+        "UPS Output Voltage: %.2f Volt\n"
+        "UPS Line Frequency :  %.2f Hz\n"
+        "UPS Input Frequency :  %.2f Hz\n"
+        "UPS Power Loading:  %.2f\n"
+        "UPS Temperature:   %.2f\n"
+        "UPS Battery Level:   %.2f\n"
+        "Input AC Power :  %s\n"
+        "Battery Status :  Normal\n"
+        "UPS Status     :  Normal\n"
+        "Boost/Buck     :  %s\n"
+        "UPS Self-Test  :  %s\n"
+        % (num(state.get("input_voltage")), num(state.get("output_voltage")),
+           num(state.get("line_frequency")),
+           num(state.get("line_frequency")), num(state.get("load")),
+           num(state.get("temperature")), num(state.get("gauge")),
+           ac, bb, test))
+
+
+def write_atomic(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(data)
+    os.replace(tmp, path)
+
+
+def parse_status(state, line):
+    parts = line[1:].split()
+    if len(parts) < 8:
+        return False
+    try:
+        input_v = float(parts[0])
+        out_v = float(parts[2])
+        load = float(parts[3])
+        freq = float(parts[4])
+        block = float(parts[5])
+        temp = float(parts[6])
+        bits = int(parts[7], 2)
+    except (ValueError, IndexError):
+        return False
+    state.update({
+        "input_voltage": input_v,
+        "output_voltage": out_v,
+        "load": load,
+        "line_frequency": freq,
+        "battery_block": block,
+        "temperature": temp,
+        "bits": bits,
+        "ac_fail": bool(bits & 0x80) or input_v < 50.0,
+        "testing": bool(bits & 0x04),
+        "gauge": gauge(block),
+    })
+    return True
+
+
+def main():
+    args = sys.argv[1:]
+    probe = "--probe" in args
+    no_shutdown = "--no-shutdown" in args
+    os.makedirs(STATE_DIR, exist_ok=True)
+
+    state = {"ts": 0, "valid": False}
+    buf = bytearray()
+    next_q1 = 0.0
+    next_publish = 0.0
+    acfail_since = read_acfail()
+    low_since = None
+    shutdown_fired = False
+    last_bits = None
+    if acfail_since is not None:
+        print("resuming AC-fail clock from %.0f s ago"
+              % (time.time() - acfail_since), flush=True)
+
+    ups = Ups()
+    if probe:
+        # Never touch the shutdown path while probing; just print what we see.
+        if not ups.open():
+            print("open failed (stop ups-poller.service first?)", file=sys.stderr)
+            return 1
+        deadline = time.time() + 20
+        next_print = 0.0
+        try:
+            while time.time() < deadline:
+                rc, data = ups.read(200)
+                if data:
+                    feed(buf, data, state)
+                if time.time() >= next_q1:
+                    ups.send(0x21, 0x09, 0x0200, 0, q1_frame())
+                    next_q1 = time.time() + Q1_SECONDS
+                if state.get("valid") and time.time() >= next_print:
+                    next_print = time.time() + 1.0
+                    print("%.1f V in, %.1f V out, load %.0f%%, %.1f Hz, "
+                          "block %.1f V, %.1f C, bits 0x%02x, gauge %.2f%%"
+                          % (state["input_voltage"], state["output_voltage"],
+                             state["load"], state["line_frequency"],
+                             state["battery_block"], state["temperature"],
+                             state["bits"], state["gauge"]))
+        finally:
+            ups.close()
+        return 0
+
+    print("ups-poller starting (shutdown %s)"
+          % ("disabled" if no_shutdown else "enabled"), flush=True)
+    while True:
+        if not ups.handle and not ups.open():
+            time.sleep(2.0)
+            continue
+        try:
+            rc, data = ups.read(200)
+            if data:
+                feed(buf, data, state)
+            elif rc == LIBUSB_ERROR_NO_DEVICE:
+                print("device gone, waiting for re-enumeration", flush=True)
+                ups.close()
+                time.sleep(2.0)
+                continue
+            now = time.time()
+            if now >= next_q1:
+                ups.send(0x21, 0x09, 0x0200, 0, q1_frame())
+                next_q1 = now + Q1_SECONDS
+            if now >= next_publish:
+                next_publish = now + PUBLISH_SECONDS
+                publish(state, now)
+                if last_bits != state.get("bits"):
+                    print("bits 0x%02x%s" % (
+                        state.get("bits") or 0,
+                        " (mains fail)" if state.get("ac_fail") else ""),
+                        flush=True)
+                    last_bits = state.get("bits")
+                if not no_shutdown and state.get("valid"):
+                    acfail, low_delay, _bad = load_timecfg()
+                    if state.get("ac_fail"):
+                        if acfail_since is None:
+                            acfail_since = now
+                            save_acfail(now)
+                            print("AC fail: shutdown timer %ss" % acfail,
+                                  flush=True)
+                        if (acfail is not None and not shutdown_fired
+                                and now - acfail_since >= acfail):
+                            print("AC fail %ss reached: running shutdown.sh"
+                                  % acfail, flush=True)
+                            shutdown_fired = True
+                            subprocess.Popen([SHUTDOWN], cwd=VENDOR_DIR)
+                        # Vendor parity: TimeCfg's battery-low delay, judged on
+                        # the same raw pack voltage the bridge uses for LB.
+                        lb = load_lb_voltage()
+                        pack = (state.get("battery_block") or 0.0) * 2.0
+                        if low_delay is not None and lb is not None and pack <= lb:
+                            if low_since is None:
+                                low_since = now
+                                print("battery low (%.2f V <= %.2f V): "
+                                      "shutdown timer %ss" % (pack, lb, low_delay),
+                                      flush=True)
+                            if not shutdown_fired and now - low_since >= low_delay:
+                                print("battery low %ss reached: running shutdown.sh"
+                                      % low_delay, flush=True)
+                                shutdown_fired = True
+                                subprocess.Popen([SHUTDOWN], cwd=VENDOR_DIR)
+                        else:
+                            low_since = None
+                    else:
+                        if acfail_since is not None:
+                            print("AC restored: shutdown timer cleared",
+                                  flush=True)
+                        acfail_since = None
+                        low_since = None
+                        shutdown_fired = False
+                        clear_acfail()
+        except Exception as exc:  # never let the service die on a bad frame
+            print("poller loop error: %s" % exc, flush=True)
+            ups.close()
+            time.sleep(1.0)
+
+
+def feed(buf, data, state):
+    ch = data[1]
+    if ch == TERMINATOR:
+        line = bytes(buf).decode("latin1").strip()
+        del buf[:]
+        if not line:
+            return
+        if line.startswith("(") and parse_status(state, line):
+            state["ts"] = time.time()
+            state["valid"] = True
+            state["line"] = line
+        elif line.startswith("#"):
+            state["info"] = line
+    elif 32 <= ch < 127:
+        buf.append(ch)
+        if len(buf) > 220:
+            del buf[:]
+
+
+def publish(state, now):
+    fresh = state.get("valid") and now - state.get("ts", 0) <= STALE_SECONDS
+    payload = {
+        "ts": round(state.get("ts", 0), 3),
+        "fresh": bool(fresh),
+        "input_voltage": state.get("input_voltage"),
+        "output_voltage": state.get("output_voltage"),
+        "load": state.get("load"),
+        "line_frequency": state.get("line_frequency"),
+        "battery_block": state.get("battery_block"),
+        "temperature": state.get("temperature"),
+        "bits": state.get("bits"),
+        "gauge": state.get("gauge"),
+        "ac_fail": state.get("ac_fail"),
+        "testing": state.get("testing"),
+        "info": state.get("info"),
+    }
+    write_atomic(STATE_PATH, json.dumps(payload) + "\n")
+    if fresh:
+        write_atomic(SCREEN_PATH, screen_text(state))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

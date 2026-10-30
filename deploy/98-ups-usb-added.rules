@@ -1,0 +1,2 @@
+# Wake-up after a physical re-plug: restart the native poller on the new device.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0925", ATTR{idProduct}=="1234", TAG+="systemd", ENV{SYSTEMD_WANTS}+="ups-usb-added.service"

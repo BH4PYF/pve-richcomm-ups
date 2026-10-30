@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+# Periodic health check + evidence capture for the UPS USB bridge.
+#
+# Every run answers the same questions in order:
+#   1. is 0925:1234 on the bus, and does the kernel say the port is configured?
+#   2. is ups-poller (native usbfs owner) alive and producing fresh state?
+#   3. does the rest of the chain (NUT) agree with reality?
+#
+# It repairs what software can repair (poller restart) and, on a drop, freezes
+# the wire evidence from the usbmon trace into /var/log/ups-incidents/<stamp>.log
+# together with the last poller frame, so the failure has a timestamp, a state
+# and a trace.
+#
+# Since the native poller replaced the vendor daemon there is no hiddev node and
+# no shared memory to inspect; /run/ups-poller/state.json is the source of truth.
+
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+POLLER_STATE = '/run/ups-poller/state.json'
+STATE = '/var/lib/ups-pve/linkcheck.json'
+INCDIR = '/var/log/ups-incidents'
+USBLOG = '/var/log/usbmon-ups.log'
+DEVNODE = '/sys/bus/usb/devices/1-14/devnum'
+SLOW_LIMIT = 3
+SELFTEST_BIT = 0x04
+
+
+def now():
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def run(cmd, timeout=30):
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return proc.returncode, (proc.stdout or '') + (proc.stderr or '')
+    except Exception as exc:
+        return 127, str(exc)
+
+
+def present():
+    code, out = run(['lsusb'])
+    return code == 0 and '0925:1234' in out
+
+
+def port_state():
+    try:
+        with open('/sys/bus/usb/devices/usb1/1-0:1.0/usb1-port14/state') as fh:
+            return fh.read().strip()
+    except OSError:
+        return 'unknown'
+
+
+def devnum():
+    try:
+        with open(DEVNODE) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def poller():
+    """Last state frame; msglen is 1 only while the timestamp is fresh."""
+    try:
+        with open(POLLER_STATE) as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    try:
+        age = time.time() - float(st.get('ts') or 0)
+    except (TypeError, ValueError):
+        return None
+    return {
+        'msglen': 1 if age <= 15.0 else 0,
+        'age': round(age, 1),
+        'ac_in': st.get('input_voltage') or 0.0,
+        'ac_out': st.get('output_voltage') or 0.0,
+        'freq': st.get('line_frequency') or 0.0,
+        'dc': st.get('battery_block') or 0.0,
+        'temp': st.get('temperature') or 0.0,
+        'load': st.get('load') or 0.0,
+        'warn': int(st.get('bits') or 0),
+    }
+
+
+def upsc():
+    code, out = run(['upsc', 'ups'])
+    values = {}
+    if code == 0:
+        for line in out.splitlines():
+            if ': ' in line:
+                key, val = line.split(': ', 1)
+                values[key.strip()] = val.strip()
+    return values
+
+
+def load_state():
+    try:
+        with open(STATE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    tmp = STATE + '.tmp'
+    with open(tmp, 'w') as fh:
+        json.dump(state, fh)
+    os.replace(tmp, STATE)
+
+
+def usb_tail(lines=400):
+    try:
+        size = os.path.getsize(USBLOG)
+        with open(USBLOG, 'rb') as fh:
+            fh.seek(max(0, size - lines * 90))
+            data = fh.read().decode('utf-8', 'replace')
+        return '\n'.join(data.splitlines()[-lines:])
+    except OSError:
+        return '(no usbmon trace)'
+
+
+def daemon():
+    code, out = run(['systemctl', 'is-active', 'ups-poller'])
+    return out.strip()
+
+
+def selftest_active():
+    """True while ups-selftest/-watch is between stopping and starting the poller.
+
+    The sender has to own interface 0 for ~15 s to push SET_REPORT, so it stops
+    ups-poller on purpose.  That window must not be mistaken for a dead daemon:
+    starting the poller underneath the transfer would fail to claim the device.
+    """
+    code, _ = run(['pgrep', '-f', '/usr/local/sbin/ups-selftest'])
+    return code == 0
+
+
+def mains_label(frame):
+    if not frame:
+        return '?'
+    return 'OL' if frame['ac_in'] > 50 else 'OB'
+
+
+def write_incident(state):
+    os.makedirs(INCDIR, exist_ok=True)
+    stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    path = os.path.join(INCDIR, stamp + '.log')
+    lines = [
+        'UPS USB drop at %s' % now(),
+        'devnum before drop: %s' % state.get('last_devnum'),
+        'port state: %s' % port_state(),
+        'poller: %s' % daemon(),
+        'last poller frame: %s' % json.dumps(state.get('last_frame'), sort_keys=True),
+        'last NUT snapshot: %s' % json.dumps(state.get('last_upsc'), sort_keys=True),
+        '',
+        '--- usbmon tail (bus 1, UPS device only) ---',
+        usb_tail(),
+    ]
+    with open(path, 'w') as fh:
+        fh.write('\n'.join(lines) + '\n')
+    return path
+
+
+def main():
+    if '--report' in sys.argv:
+        files = sorted(os.listdir(INCDIR)) if os.path.isdir(INCDIR) else []
+        print('%d incident file(s) in %s' % (len(files), INCDIR))
+        for name in files[-20:]:
+            print('  ' + name)
+        print('state:')
+        print(json.dumps(load_state(), indent=2, sort_keys=True))
+        return 0
+
+    state = load_state()
+    live = present()
+    frame = poller()
+    nut = upsc()
+    stamp = now()
+    problems = []
+
+    if live:
+        state['last_devnum'] = devnum()
+        if frame:
+            state['last_frame'] = frame
+        if nut:
+            state['last_upsc'] = {k: nut[k] for k in
+                                  ('ups.status', 'battery.charge', 'battery.voltage',
+                                   'battery.runtime') if k in nut}
+        if state.get('missing_since'):
+            gone = time.time() - state['missing_since']
+            print('%s link back after %.1f min (device %s)' %
+                  (stamp, gone / 60.0, state['last_devnum']))
+            state.pop('missing_since', None)
+            state['last_recovery'] = stamp
+        if daemon() != 'active':
+            if selftest_active():
+                print('%s ups-poller stopped for a self-test, leaving it alone' % stamp)
+            else:
+                print('%s ups-poller not active, starting' % stamp)
+                run(['systemctl', 'start', 'ups-poller'])
+                problems.append('poller started')
+        elif frame is None or not frame['msglen']:
+            state['blind'] = state.get('blind', 0) + 1
+            print('%s poller alive but state not fresh (%d/%d)' %
+                  (stamp, state['blind'], SLOW_LIMIT))
+            if state['blind'] >= SLOW_LIMIT and not (frame and frame['warn'] & SELFTEST_BIT):
+                print('%s restarting ups-poller to re-open the USB handle' % stamp)
+                run(['systemctl', 'restart', 'ups-poller'])
+                state['blind'] = 0
+                problems.append('poller restarted')
+        else:
+            state['blind'] = 0
+            print('%s ok: dev %s %s ac %.0f dc %.2f load %.0f%% warn 0x%02x nut %s' %
+                  (stamp, state['last_devnum'], mains_label(frame), frame['ac_in'],
+                   frame['dc'], frame['load'], frame['warn'],
+                   nut.get('ups.status', '?')))
+        if ('ALARM' in nut.get('ups.status', '') or 'ups.alarm' in nut) and frame \
+                and frame['dc'] > 5:
+            print('%s NUT still carries the alarm after recovery' % stamp)
+            problems.append('alarm pending')
+    else:
+        if not state.get('missing_since'):
+            state['missing_since'] = time.time()
+            state['drops_total'] = state.get('drops_total', 0) + 1
+            state['drops_today'] = state.get('drops_today', 0) + 1
+            path = write_incident(state)
+            print('%s LOST: device gone from the bus (drop #%d today), evidence %s' %
+                  (stamp, state['drops_today'], path))
+        else:
+            gone = (time.time() - state['missing_since']) / 60.0
+            print('%s still missing for %.1f min (port %s, last frame %s)' %
+                  (stamp, gone, port_state(), mains_label(state.get('last_frame'))))
+
+    if problems:
+        state['last_actions'] = problems
+        state['last_action_ts'] = stamp
+    state['last_run'] = stamp
+    save_state(state)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

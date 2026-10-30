@@ -1,0 +1,10 @@
+# upsd users (PVE host)
+# Synology DSM logs in to a "Synology UPS server" / NUT server with the
+# well-known monuser/secret credentials, so keep this account read-only.
+#
+# IMPORTANT: replace CHANGE_ME before deploying, and use the same password
+# on the NAS side.  The live host used during development kept NUT's default
+# "secret"; do not publish a real password.
+[monuser]
+    password = CHANGE_ME
+    upsmon secondary

@@ -1,0 +1,15 @@
+[Unit]
+Description=Richcomm UPS usbfs poller (native replacement for ups_monitor)
+After=network.target
+Before=ups-nut-bridge.service
+Conflicts=ups-manager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/ups-poller
+Restart=always
+RestartSec=3
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

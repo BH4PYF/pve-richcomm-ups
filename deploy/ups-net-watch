@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Correlate UPS state with NIC link health.
+
+Samples every 15 s into /var/log/ups-net-correlate.csv and writes an
+incident snapshot into /var/log/nic-incidents/ whenever the link changes
+(carrier_changes or speed) or the UPS changes mode (OB/OL/TEST/LB).
+
+Run as the ups-net-watch.service unit on the PVE host.
+"""
+
+import datetime
+import json
+import os
+import shutil
+import subprocess
+import time
+
+IFACE = "nic0"
+STATE = "/run/ups-poller/state.json"
+LOG = "/var/log/ups-net-correlate.csv"
+INC = "/var/log/nic-incidents"
+INTERVAL = 15
+HEADER = (
+    "ts,iso,speed,carrier_changes,crc,rxerr,input,output,freq,load,"
+    "temp,block,pack,bits,gauge,ac_fail,testing,fresh"
+)
+
+ETHTOOL = shutil.which("ethtool") or "/usr/sbin/ethtool"
+
+
+def read_state():
+    try:
+        with open(STATE, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def read_int(path, default=0):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return default
+
+
+def nic_stats():
+    speed = read_int("/sys/class/net/%s/speed" % IFACE, 0)
+    changes = read_int("/sys/class/net/%s/carrier_changes" % IFACE, 0)
+    crc = err = ""
+    try:
+        out = subprocess.run(
+            [ETHTOOL, "-S", IFACE], capture_output=True, text=True, timeout=5
+        ).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            name = parts[0].rstrip(":")
+            if name == "rx_crc_errors":
+                crc = parts[1]
+            elif name == "rx_errors":
+                err = parts[1]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return speed, changes, crc, err
+
+
+def make_row():
+    state = read_state()
+    speed, changes, crc, err = nic_stats()
+    block = state.get("battery_block")
+    pack = round(block * 2.0, 2) if isinstance(block, (int, float)) else ""
+    now = time.time()
+    iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    row = ",".join(
+        str(value)
+        for value in (
+            int(now),
+            iso,
+            speed,
+            changes,
+            crc,
+            err,
+            state.get("input_voltage", ""),
+            state.get("output_voltage", ""),
+            state.get("line_frequency", ""),
+            state.get("load", ""),
+            state.get("temperature", ""),
+            block if block is not None else "",
+            pack,
+            state.get("bits", ""),
+            state.get("gauge", ""),
+            int(bool(state.get("ac_fail"))),
+            int(bool(state.get("testing"))),
+            int(bool(state.get("fresh"))),
+        )
+    )
+    return row, state, (speed, changes, crc, err)
+
+
+def tail(path, count):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return "".join(handle.readlines()[-count:])
+    except OSError:
+        return ""
+
+
+def snapshot(reason, row, state, nic):
+    os.makedirs(INC, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(INC, "%s-%s.log" % (stamp, reason))
+    speed, changes, crc, err = nic
+    parts = [
+        "reason: %s" % reason,
+        "nic: speed=%s carrier_changes=%s rx_crc_errors=%s rx_errors=%s"
+        % (speed, changes, crc, err),
+        "--- ups state ---",
+        json.dumps(state, ensure_ascii=False, indent=1),
+        "",
+        "--- last 40 correlate rows ---",
+        tail(LOG, 40),
+        "",
+        "--- kernel link events (15 min) ---",
+    ]
+    try:
+        out = subprocess.run(
+            ["journalctl", "-k", "--since", "-15 min", "--no-pager"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+        parts.extend(
+            line
+            for line in out.splitlines()
+            if "nic0" in line or "vmbr0" in line or "e1000e" in line
+        )
+    except (OSError, subprocess.SubprocessError):
+        parts.append("(journalctl unavailable)")
+    parts.extend(["", "--- upsc ups ---"])
+    try:
+        out = subprocess.run(
+            ["upsc", "ups"], capture_output=True, text=True, timeout=5
+        ).stdout
+        parts.append(out)
+    except (OSError, subprocess.SubprocessError):
+        parts.append("(upsc unavailable)")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(parts) + "\n")
+    print("incident: %s -> %s" % (reason, path), flush=True)
+
+
+def main():
+    os.makedirs(INC, exist_ok=True)
+    if not os.path.exists(LOG):
+        with open(LOG, "w", encoding="utf-8") as handle:
+            handle.write(HEADER + "\n")
+    _, _, nic = make_row()
+    prev_cc, prev_speed = nic[1], nic[0]
+    prev_mode = None
+    print(
+        "ups-net-watch started on %s (speed=%s carrier_changes=%s)"
+        % (IFACE, prev_speed, prev_cc),
+        flush=True,
+    )
+    if prev_speed and prev_speed != 1000:
+        row, state, nic = make_row()
+        snapshot("link-degraded-at-start", row, state, nic)
+    while True:
+        row, state, nic = make_row()
+        with open(LOG, "a", encoding="utf-8") as handle:
+            handle.write(row + "\n")
+        speed, changes, crc, err = nic
+        raw_input = state.get("input_voltage")
+        mode = (
+            bool(state.get("ac_fail")),
+            bool(state.get("testing")),
+            isinstance(raw_input, (int, float)) and raw_input > 50,
+            state.get("bits"),
+        )
+        if prev_mode is not None and mode != prev_mode:
+            snapshot("ups-mode-change", row, state, nic)
+        if changes != prev_cc or speed != prev_speed:
+            snapshot("link-event", row, state, nic)
+        prev_cc, prev_speed, prev_mode = changes, speed, mode
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,33 @@
+#!/bin/sh
+#
+# Richcomm Power Manager 管理入口（Ubuntu 24.04 / systemd 版）
+# 安装到 /usr/local/sbin/ups_manager
+#
+APP_DIR="/opt/ups-manager"
+SERVICE="ups-manager.service"
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "需要 root 权限：sudo ups_manager $*" >&2
+    exit 1
+fi
+
+cd "$APP_DIR" 2>/dev/null || { echo "未找到 $APP_DIR，请先运行 install.sh" >&2; exit 1; }
+
+case "${1:-}" in
+    start)   exec systemctl start "$SERVICE" ;;
+    stop)    exec systemctl stop "$SERVICE" ;;
+    restart) exec systemctl restart "$SERVICE" ;;
+    service) exec systemctl status "$SERVICE" --no-pager -l ;;
+    logs)    exec journalctl -u "$SERVICE" -f ;;
+    status)  shift; exec ./ups_status "$@" ;;
+    config)  shift; exec ./ups_config "$@" ;;
+    *)
+        echo "用法: ups_manager {start|stop|restart|service|logs|status|config}"
+        echo "  start/stop/restart  控制 UPS 监控服务"
+        echo "  service             查看 systemd 服务状态"
+        echo "  logs                实时跟踪服务日志"
+        echo "  status              实时 UPS 状态界面（Ctrl+C 退出）"
+        echo "  config              修改串口号、延时等配置"
+        exit 1
+        ;;
+esac

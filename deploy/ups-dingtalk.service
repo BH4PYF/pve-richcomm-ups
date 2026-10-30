@@ -1,0 +1,14 @@
+[Unit]
+Description=UPS anomaly monitor with DingTalk alerts
+After=network-online.target nut-server.service ups-nut-bridge.service
+Wants=network-online.target nut-server.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/ups-pve/dingtalk_monitor.py
+Restart=always
+RestartSec=10
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

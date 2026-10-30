@@ -1,0 +1,26 @@
+[Unit]
+Description=Richcomm Power Manager UPS monitor (legacy i386)
+# 串口设备就绪后再启动（设备不存在时不会阻塞启动）
+After=dev-ttyS0.device
+# 若使用 USB HID，可取消下面两行注释
+#Wants=systemd-udev-settle.service
+#After=systemd-udev-settle.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=@APP_DIR@
+Environment=LANG=C
+# 程序内部会调用 clear；无终端时用 dumb 避免 TERM 报错
+Environment=TERM=dumb
+ExecStart=@APP_DIR@/ups_monitor
+# 程序响应 SIGTERM，由 systemd 直接结束；无需 ExecStop
+KillSignal=SIGTERM
+TimeoutStopSec=15
+# UPS 未接/通讯失败退出后自动重试
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

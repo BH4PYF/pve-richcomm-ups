@@ -1,0 +1,5 @@
+# The UPS USB bridge (0925:1234) drops off the bus and does not re-enumerate on
+# its own; runtime suspend is the one host-side mechanism that can produce a
+# silent detach.  Keep the device and its root-hub port powered.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0925", ATTR{idProduct}=="1234", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0925", ATTR{idProduct}=="1234", ATTR{power/autosuspend_delay_ms}="0"

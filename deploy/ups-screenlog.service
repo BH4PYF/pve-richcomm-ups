@@ -1,0 +1,14 @@
+[Unit]
+Description=Richcomm UPS vendor status screen logger
+After=ups-manager.service
+Wants=ups-manager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/ups-pve/ups-screenlog.py
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
